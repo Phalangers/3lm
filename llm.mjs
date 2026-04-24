@@ -1,26 +1,55 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, unlinkSync, createWriteStream } from "node:fs";
+import { arch, platform } from "node:os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const LLAMA_DIR = join(__dirname, "bin", "llama-b8902");
+// --- platform detection ---
+
+const LLAMA_VERSION = "b8918";
+
+function detectPlatform() {
+  const os = platform();
+  const cpu = arch();
+  const isAndroid = os === "linux" && existsSync("/system/bin");
+
+  if (isAndroid && cpu === "arm64") return "android-arm64";
+  if (os === "linux" && cpu === "arm64") return "linux-arm64";
+  if (os === "linux" && cpu === "x64") return "linux-x64";
+  if (os === "darwin" && cpu === "arm64") return "macos-arm64";
+  if (os === "darwin" && cpu === "x64") return "macos-x64";
+  return null;
+}
+
+const PLATFORM_ASSETS = {
+  "linux-arm64":   `llama-${LLAMA_VERSION}-bin-ubuntu-arm64.tar.gz`,
+  "linux-x64":     `llama-${LLAMA_VERSION}-bin-ubuntu-x64.tar.gz`,
+  "android-arm64": `llama-${LLAMA_VERSION}-bin-android-arm64.tar.gz`,
+  "macos-arm64":   `llama-${LLAMA_VERSION}-bin-macos-arm64.tar.gz`,
+  "macos-x64":     `llama-${LLAMA_VERSION}-bin-macos-x64.tar.gz`,
+};
+
+const plat = detectPlatform();
+const LLAMA_DIR = join(__dirname, "bin", plat || "unknown");
 const LLAMA_SERVER = join(LLAMA_DIR, "llama-server");
 
 const MODELS = {
   qwen: {
     name: "Qwen3 0.6B",
     file: "qwen3-0.6b-q8_0.gguf",
+    url: "https://huggingface.co/ggml-org/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
     port: 8787,
     noThinkTag: "/no_think",
   },
   gemma: {
     name: "Gemma 4 E2B",
     file: "gemma-4-E2B-it-Q4_K_M.gguf",
+    url: "https://huggingface.co/bartowski/google_gemma-4-E2B-it-GGUF/resolve/main/google_gemma-4-E2B-it-Q4_K_M.gguf",
     port: 8788,
     extraArgs: (thinking) => ["--flash-attn", "on", "--reasoning", thinking ? "on" : "off"],
   },
@@ -31,6 +60,78 @@ const MODELS = {
 function fatal(msg) {
   console.error(`\x1b[31merror:\x1b[0m ${msg}`);
   process.exit(1);
+}
+
+async function downloadWithProgress(url, label) {
+  console.log(`Downloading ${label}...`);
+  const res = await fetch(url, { redirect: "follow" });
+  if (!res.ok) fatal(`download failed: ${res.status} ${res.statusText}`);
+
+  const total = parseInt(res.headers.get("content-length") || "0");
+  let downloaded = 0;
+  const chunks = [];
+  const reader = res.body.getReader();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    downloaded += value.length;
+    const mb = (downloaded / 1e6).toFixed(0);
+    const totalMb = total ? ` / ${(total / 1e6).toFixed(0)} MB` : "";
+    const pct = total ? ` (${((downloaded / total) * 100).toFixed(0)}%)` : "";
+    process.stdout.write(`\r  ${mb}${totalMb}${pct}  `);
+  }
+  console.log();
+  return chunks;
+}
+
+async function downloadModel(model) {
+  const modelsDir = join(__dirname, "models");
+  mkdirSync(modelsDir, { recursive: true });
+
+  const dest = join(modelsDir, model.file);
+  const tmp = dest + ".tmp";
+
+  const chunks = await downloadWithProgress(model.url, model.name);
+
+  const fileStream = createWriteStream(tmp);
+  for (const chunk of chunks) fileStream.write(chunk);
+  await new Promise((resolve, reject) => {
+    fileStream.on("finish", resolve);
+    fileStream.on("error", reject);
+    fileStream.end();
+  });
+
+  renameSync(tmp, dest);
+  console.log(`  Saved to ${dest}`);
+}
+
+async function ensureBinaries() {
+  if (existsSync(LLAMA_SERVER)) return;
+  if (!plat) fatal(`unsupported platform: ${platform()}/${arch()}`);
+
+  const asset = PLATFORM_ASSETS[plat];
+  if (!asset) fatal(`no prebuilt binary for ${plat}`);
+
+  const url = `https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/${asset}`;
+  const chunks = await downloadWithProgress(url, `llama.cpp for ${plat}`);
+
+  const tmp = join(__dirname, "bin", `${plat}.tmp.tar.gz`);
+  mkdirSync(join(__dirname, "bin"), { recursive: true });
+
+  const fileStream = createWriteStream(tmp);
+  for (const chunk of chunks) fileStream.write(chunk);
+  await new Promise((resolve, reject) => {
+    fileStream.on("finish", resolve);
+    fileStream.on("error", reject);
+    fileStream.end();
+  });
+
+  mkdirSync(LLAMA_DIR, { recursive: true });
+  execSync(`tar xzf "${tmp}" -C "${LLAMA_DIR}" --strip-components=1`);
+  unlinkSync(tmp);
+  console.log(`  Installed to ${LLAMA_DIR}`);
 }
 
 async function serverAlive(baseUrl) {
@@ -55,11 +156,12 @@ async function waitForServer(baseUrl, maxWait = 120_000) {
 async function ensureServer(baseUrl, model, opts) {
   if (await serverAlive(baseUrl)) return;
 
-  // kill stale process if we own one
   if (opts.proc) {
     opts.proc.kill("SIGKILL");
     opts.proc = null;
   }
+
+  await ensureBinaries();
 
   console.log(`Starting ${model.name}...`);
 
@@ -164,6 +266,27 @@ async function chat(baseUrl, messages, modelLabel) {
 
 // --- main ---
 
+// handle "download" subcommand
+if (process.argv[2] === "download") {
+  const which = process.argv[3];
+  if (which === "bin" || which === "binaries") {
+    await ensureBinaries();
+    process.exit(0);
+  }
+  const toDownload = which
+    ? { [which]: MODELS[which] || fatal(`unknown model "${which}". Available: ${Object.keys(MODELS).join(", ")}, bin`) }
+    : { qwen: MODELS.qwen };
+  for (const [key, m] of Object.entries(toDownload)) {
+    const dest = join(__dirname, "models", m.file);
+    if (existsSync(dest)) {
+      console.log(`${m.name} already downloaded.`);
+    } else {
+      await downloadModel(m);
+    }
+  }
+  process.exit(0);
+}
+
 const args = process.argv.slice(2);
 let modelKey = "qwen";
 let ctxSize = 2048;
@@ -177,6 +300,8 @@ for (let i = 0; i < args.length; i++) {
   if (args[i] === "--think") showThinking = true;
   if (args[i] === "--help" || args[i] === "-h") {
     console.log(`Usage: node llm.mjs [options]
+  node llm.mjs download [qwen|gemma|bin]
+
 Options:
   -m, --model   Model to use: ${Object.keys(MODELS).join(", ")} (default: qwen)
   --ctx N       Context size (default: 2048)
@@ -191,7 +316,9 @@ const model = MODELS[modelKey];
 if (!model) fatal(`unknown model "${modelKey}". Available: ${Object.keys(MODELS).join(", ")}`);
 
 const modelPath = join(__dirname, "models", model.file);
-if (!existsSync(modelPath)) fatal(`model not found: ${modelPath}`);
+if (!existsSync(modelPath)) {
+  await downloadModel(model);
+}
 
 const baseUrl = `http://127.0.0.1:${model.port}`;
 const opts = { proc: null, modelPath, ctxSize, threads, showThinking };

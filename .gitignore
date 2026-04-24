@@ -1,3 +1,7 @@
 node_modules/
 models/
-bin/
+
+# auto-downloaded platform binaries
+bin/android-arm64/
+bin/macos-arm64/
+bin/macos-x64/
