@@ -55,13 +55,19 @@ const MODELS = {
 
 // --- helpers ---
 
+let quiet = false;
+
 function fatal(msg) {
   console.error(`\x1b[31merror:\x1b[0m ${msg}`);
   process.exit(1);
 }
 
+function log(msg) {
+  if (!quiet) console.log(msg);
+}
+
 async function downloadToFile(url, label, destPath) {
-  console.log(`Downloading ${label}...`);
+  log(`Downloading ${label}...`);
   const res = await fetch(url, { redirect: "follow" });
   if (!res.ok) fatal(`download failed: ${res.status} ${res.statusText}`);
 
@@ -78,9 +84,9 @@ async function downloadToFile(url, label, destPath) {
     const mb = (downloaded / 1e6).toFixed(0);
     const totalMb = total ? ` / ${(total / 1e6).toFixed(0)} MB` : "";
     const pct = total ? ` (${((downloaded / total) * 100).toFixed(0)}%)` : "";
-    process.stdout.write(`\r  ${mb}${totalMb}${pct}  `);
+    if (!quiet) process.stdout.write(`\r  ${mb}${totalMb}${pct}  `);
   }
-  console.log();
+  if (!quiet) console.log();
   await new Promise((resolve, reject) => {
     fileStream.on("finish", resolve);
     fileStream.on("error", reject);
@@ -97,7 +103,7 @@ async function downloadModel(model) {
 
   await downloadToFile(model.url, model.name, tmp);
   renameSync(tmp, dest);
-  console.log(`  Saved to ${dest}`);
+  log(`  Saved to ${dest}`);
 }
 
 async function ensureBinaries() {
@@ -116,7 +122,7 @@ async function ensureBinaries() {
   mkdirSync(LLAMA_DIR, { recursive: true });
   execSync(`tar xzf "${tmp}" -C "${LLAMA_DIR}" --strip-components=1`);
   unlinkSync(tmp);
-  console.log(`  Installed to ${LLAMA_DIR}`);
+  log(`  Installed to ${LLAMA_DIR}`);
 }
 
 async function serverAlive(baseUrl) {
@@ -148,7 +154,7 @@ async function ensureServer(baseUrl, model, opts) {
 
   await ensureBinaries();
 
-  console.log(`Starting ${model.name}...`);
+  log(`Starting ${model.name}...`);
 
   const serverArgs = [
     "-m", opts.modelPath,
@@ -222,7 +228,7 @@ async function chat(baseUrl, messages, modelLabel) {
         const delta = json.choices?.[0]?.delta;
 
         const reasonToken = delta?.reasoning_content;
-        if (reasonToken) {
+        if (reasonToken && !quiet) {
           if (!inThinking) {
             inThinking = true;
             process.stdout.write("\x1b[2m(thinking) ");
@@ -232,7 +238,7 @@ async function chat(baseUrl, messages, modelLabel) {
 
         const token = delta?.content;
         if (token) {
-          if (inThinking && !startedContent) {
+          if (inThinking && !startedContent && !quiet) {
             inThinking = false;
             startedContent = true;
             process.stdout.write(`\x1b[0m\n\x1b[33m${modelLabel}>\x1b[0m `);
@@ -244,7 +250,7 @@ async function chat(baseUrl, messages, modelLabel) {
     }
   }
 
-  if (inThinking) process.stdout.write("\x1b[0m");
+  if (inThinking && !quiet) process.stdout.write("\x1b[0m");
   process.stdout.write("\n");
   return full;
 }
@@ -323,6 +329,7 @@ process.on("exit", cleanup);
 const label = modelKey;
 
 if (promptArg) {
+  quiet = true;
   const content = (!showThinking && model.noThinkTag)
     ? `${model.noThinkTag}\n${promptArg}`
     : promptArg;
