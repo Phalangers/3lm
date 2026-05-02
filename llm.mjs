@@ -16,9 +16,7 @@ const LLAMA_VERSION = "b8918";
 function detectPlatform() {
   const os = platform();
   const cpu = arch();
-  const isAndroid = os === "linux" && existsSync("/system/bin");
-
-  if (isAndroid && cpu === "arm64") return "android-arm64";
+  if (os === "android" && cpu === "arm64") return "android-arm64";
   if (os === "linux" && cpu === "arm64") return "linux-arm64";
   if (os === "linux" && cpu === "x64") return "linux-x64";
   if (os === "darwin" && cpu === "arm64") return "macos-arm64";
@@ -62,20 +60,20 @@ function fatal(msg) {
   process.exit(1);
 }
 
-async function downloadWithProgress(url, label) {
+async function downloadToFile(url, label, destPath) {
   console.log(`Downloading ${label}...`);
   const res = await fetch(url, { redirect: "follow" });
   if (!res.ok) fatal(`download failed: ${res.status} ${res.statusText}`);
 
   const total = parseInt(res.headers.get("content-length") || "0");
   let downloaded = 0;
-  const chunks = [];
+  const fileStream = createWriteStream(destPath);
   const reader = res.body.getReader();
 
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    chunks.push(value);
+    fileStream.write(value);
     downloaded += value.length;
     const mb = (downloaded / 1e6).toFixed(0);
     const totalMb = total ? ` / ${(total / 1e6).toFixed(0)} MB` : "";
@@ -83,7 +81,11 @@ async function downloadWithProgress(url, label) {
     process.stdout.write(`\r  ${mb}${totalMb}${pct}  `);
   }
   console.log();
-  return chunks;
+  await new Promise((resolve, reject) => {
+    fileStream.on("finish", resolve);
+    fileStream.on("error", reject);
+    fileStream.end();
+  });
 }
 
 async function downloadModel(model) {
@@ -93,16 +95,7 @@ async function downloadModel(model) {
   const dest = join(modelsDir, model.file);
   const tmp = dest + ".tmp";
 
-  const chunks = await downloadWithProgress(model.url, model.name);
-
-  const fileStream = createWriteStream(tmp);
-  for (const chunk of chunks) fileStream.write(chunk);
-  await new Promise((resolve, reject) => {
-    fileStream.on("finish", resolve);
-    fileStream.on("error", reject);
-    fileStream.end();
-  });
-
+  await downloadToFile(model.url, model.name, tmp);
   renameSync(tmp, dest);
   console.log(`  Saved to ${dest}`);
 }
@@ -115,18 +108,10 @@ async function ensureBinaries() {
   if (!asset) fatal(`no prebuilt binary for ${plat}`);
 
   const url = `https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/${asset}`;
-  const chunks = await downloadWithProgress(url, `llama.cpp for ${plat}`);
-
   const tmp = join(__dirname, "bin", `${plat}.tmp.tar.gz`);
   mkdirSync(join(__dirname, "bin"), { recursive: true });
 
-  const fileStream = createWriteStream(tmp);
-  for (const chunk of chunks) fileStream.write(chunk);
-  await new Promise((resolve, reject) => {
-    fileStream.on("finish", resolve);
-    fileStream.on("error", reject);
-    fileStream.end();
-  });
+  await downloadToFile(url, `llama.cpp for ${plat}`, tmp);
 
   mkdirSync(LLAMA_DIR, { recursive: true });
   execSync(`tar xzf "${tmp}" -C "${LLAMA_DIR}" --strip-components=1`);
@@ -292,18 +277,21 @@ let modelKey = "qwen";
 let ctxSize = 2048;
 let threads = 8;
 let showThinking = false;
+let promptArg = null;
 
 for (let i = 0; i < args.length; i++) {
   if ((args[i] === "--model" || args[i] === "-m") && args[i + 1]) modelKey = args[++i];
-  if (args[i] === "--ctx" && args[i + 1]) ctxSize = parseInt(args[++i]);
-  if (args[i] === "--threads" && args[i + 1]) threads = parseInt(args[++i]);
-  if (args[i] === "--think") showThinking = true;
-  if (args[i] === "--help" || args[i] === "-h") {
+  else if (args[i] === "--ctx" && args[i + 1]) ctxSize = parseInt(args[++i]);
+  else if (args[i] === "--threads" && args[i + 1]) threads = parseInt(args[++i]);
+  else if (args[i] === "--think") showThinking = true;
+  else if ((args[i] === "--prompt" || args[i] === "-p") && args[i + 1]) promptArg = args[++i];
+  else if (args[i] === "--help" || args[i] === "-h") {
     console.log(`Usage: node llm.mjs [options]
   node llm.mjs download [qwen|gemma|bin]
 
 Options:
   -m, --model   Model to use: ${Object.keys(MODELS).join(", ")} (default: qwen)
+  -p, --prompt  Send a single prompt and exit (non-interactive)
   --ctx N       Context size (default: 2048)
   --threads N   CPU threads (default: 8)
   --think       Enable model thinking/reasoning
@@ -333,6 +321,20 @@ process.on("SIGTERM", () => { cleanup(); process.exit(0); });
 process.on("exit", cleanup);
 
 const label = modelKey;
+
+if (promptArg) {
+  const content = (!showThinking && model.noThinkTag)
+    ? `${model.noThinkTag}\n${promptArg}`
+    : promptArg;
+  try {
+    await chat(baseUrl, [{ role: "user", content }], label);
+  } catch (err) {
+    console.error(`\x1b[31merror:\x1b[0m ${err.cause?.code || err.message}`);
+  }
+  cleanup();
+  process.exit(0);
+}
+
 console.log(`\x1b[32m${model.name} ready!\x1b[0m (ctx=${ctxSize}, threads=${threads})`);
 console.log('Type your message. "/clear" to reset, "/quit" to exit.\n');
 
