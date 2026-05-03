@@ -317,6 +317,8 @@ if (!existsSync(modelPath)) {
 const baseUrl = `http://127.0.0.1:${model.port}`;
 const opts = { proc: null, modelPath, ctxSize, threads, showThinking };
 
+if (promptArg) quiet = true;
+
 await ensureServer(baseUrl, model, opts);
 
 function cleanup() {
@@ -329,7 +331,6 @@ process.on("exit", cleanup);
 const label = modelKey;
 
 if (promptArg) {
-  quiet = true;
   const content = (!showThinking && model.noThinkTag)
     ? `${model.noThinkTag}\n${promptArg}`
     : promptArg;
